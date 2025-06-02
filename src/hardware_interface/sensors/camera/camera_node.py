@@ -1,53 +1,49 @@
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 import cv2
 import numpy as np
-from rcl_interfaces.msg import SetParametersResult
+import os
 from .camera_calibration import CameraCalibration
 
 
-class CameraNode(Node):
-    """手术机器人摄像头接口ROS 2节点"""
+class CameraNode:
+    """手术机器人摄像头接口"""
 
-    def __init__(self):
-        super().__init__('camera_node')
+    def __init__(self,yaml_path):
 
-        # 声明参数
-        self.declare_parameter('camera_id', 0)
-        self.declare_parameter('fps', 30)
-        self.declare_parameter('resolution', [640, 480])
-        self.declare_parameter('calibration_file', '')
-        self.declare_parameter('undistort', False)
+        self.yaml_path = yaml_path
+        self.loaded_calibration = CameraCalibration.load_from_yaml(self.yaml_path)
 
-        # 获取参数
-        self.camera_id = self.get_parameter('camera_id').value
-        self.fps = self.get_parameter('fps').value
-        self.resolution = self.get_parameter('resolution').value
-        self.calibration_file = self.get_parameter('calibration_file').value
-        self.undistort = self.get_parameter('undistort').value
-
-        # 注册参数回调
-        self.add_on_set_parameters_callback(self.parameters_callback)
+        # 初始化参数
+        self.camera_id = 0
+        self.fps = 60
+        self.resolution = (2560,720)
+        self.undistort = False
+        self.focal = self.loaded_calibration.left_camera_matrix[0][0]
+        self.baseline = self.loaded_calibration.translation_vector[0]
+        self.cx = self.loaded_calibration.left_camera_matrix[0][2]
+        self.cy = self.loaded_calibration.translation_vector[1][2]
+        self.img_size = (1280, 720)
 
         # 初始化摄像头
         self.cap = None
-        self.bridge = CvBridge()
-        self.calibration = None
         self.initialize_camera()
 
-        # 创建图像发布者
-        self.image_pub = self.create_publisher(
-            Image,
-            'camera/image_raw',
-            10
-        )
+        self.save_path = "../../../../tmp"
+        self.left_path = os.path.join(self.save_path, "left")
+        self.right_path = os.path.join(self.save_path, "right")
+        self._create_directory(self.left_path)
+        self._create_directory(self.right_path)
 
-        # 创建定时器
-        self.timer = self.create_timer(1.0 / self.fps, self.publish_image)
+        self.frame_count = 0
 
-        self.get_logger().info(f'摄像头节点已启动，ID: {self.camera_id}')
+    def _create_directory(self, path):
+        """创建目录（如果不存在）"""
+        if not os.path.exists(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+                print(f"创建目录: {path}")
+            except OSError as e:
+                print(f"无法创建目录 {path}: {e}")
+                raise
 
     def initialize_camera(self):
         """初始化摄像头设备"""
@@ -68,99 +64,90 @@ class CameraNode(Node):
 
             # 检查摄像头是否成功打开
             if not self.cap.isOpened():
-                self.get_logger().error(f"无法打开摄像头 ID: {self.camera_id}")
+                print(f"无法打开摄像头 ID: {self.camera_id}")
                 return
 
-            # 加载相机校准参数（如果有）
-            if self.undistort and self.calibration_file:
-                self.calibration = CameraCalibration()
-                if not self.calibration.load_calibration(self.calibration_file):
-                    self.get_logger().warn("无法加载校准文件，取消图像去畸变")
-                    self.undistort = False
-
-            self.get_logger().info(
-                f"摄像头已初始化 - 分辨率: {self.resolution[0]}x{self.resolution[1]}, "
-                f"帧率: {self.fps} FPS"
-            )
+            print(f"摄像头已初始化 - 分辨率: {self.resolution[0]}x{self.resolution[1]}, 帧率: {self.fps} FPS")
 
         except Exception as e:
-            self.get_logger().error(f"摄像头初始化错误: {str(e)}")
+            print(f"摄像头初始化错误: {str(e)}")
+
+    def calibration_undistort_image(self,frame):
+        left_frame = frame[0:720, 0:1280]
+        right_frame = frame[0:720, 1280:2560]
+
+        left_rectify, right_rectify, left_map, right_map, Q, valid_roi1, valid_roi2 = cv2.stereoRectify(
+            self.loaded_calibration.left_camera_matrix,
+            self.loaded_calibration.left_dist_coeffs,
+            self.loaded_calibration.right_camera_matrix,
+            self.loaded_calibration.right_dist_coeffs,
+            self.img_size, self.loaded_calibration.rotation_matrix, self.loaded_calibration.translation_vector)
+        maplx, maply = cv2.initUndistortRectifyMap(self.loaded_calibration.left_camera_matrix,
+                                                   self.loaded_calibration.left_dist_coeffs,
+                                                   left_rectify, left_map,
+                                                   self.img_size, cv2.CV_16SC2)
+        maprx, mapry = cv2.initUndistortRectifyMap(self.loaded_calibration.right_camera_matrix,
+                                                   self.loaded_calibration.right_dist_coeffs,
+                                                   right_rectify, right_map,
+                                                   self.img_size, cv2.CV_16SC2)
+        left_image_corrected = cv2.remap(left_frame, maplx, maply, cv2.INTER_LINEAR)
+        right_image_corrected = cv2.remap(right_frame, maprx, mapry, cv2.INTER_LINEAR)
+        return left_image_corrected, right_image_corrected
 
     def publish_image(self):
         """捕获并发布图像"""
+
+        # 加入可拍照的选项并保存到tem文件夹下
         if self.cap is None or not self.cap.isOpened():
             return
 
         try:
-            # 读取一帧
-            ret, frame = self.cap.read()
+            while self.cap.isOpened():
+                # 读取一帧
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("无法获取图像帧")
+                    return
+                left_frame = frame[0:720, 0:1280]
+                right_frame = frame[0:720, 1280:2560]
+                # 图像去畸变（如果已校准）
+                if not self.undistort:
+                    left_frame,right_frame = self.calibration_undistort_image(frame)
 
-            if not ret:
-                self.get_logger().warn("无法获取图像帧")
-                return
+                cv2.imshow('left', left_frame)
+                cv2.imshow('right', right_frame)
 
-            # 图像去畸变（如果已校准）
-            if self.undistort and self.calibration:
-                frame = self.calibration.undistort_image(frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord(' '):  # 按下空格键保存图像
+                    self.frame_count += 1
+                    filename_left = f"left_{self.frame_count}.jpg"
+                    filename_right = f"right_{self.frame_count}.jpg"
+                    cv2.imwrite(os.path.join(self.left_path, filename_left), left_frame)
+                    cv2.imwrite(os.path.join(self.right_path, filename_right), right_frame)
 
-            # 转换为ROS消息
-            img_msg = self.bridge.cv2_to_imgmsg(frame, "bgr8")
-            img_msg.header.stamp = self.get_clock().now().to_msg()
-            img_msg.header.frame_id = "camera_link"
+                    print(f"图片已保存: {filename_left}")
+                    print(f"图片已保存: {filename_right}")
 
-            # 发布图像
-            self.image_pub.publish(img_msg)
+                if key == ord('q'):
+                    break
 
         except Exception as e:
-            self.get_logger().error(f"发布图像时出错: {str(e)}")
-
-    def parameters_callback(self, params):
-        """参数变更回调"""
-        needs_reinit = False
-
-        for param in params:
-            if param.name == 'camera_id' and param.value != self.camera_id:
-                self.camera_id = param.value
-                needs_reinit = True
-            elif param.name == 'fps' and param.value != self.fps:
-                self.fps = param.value
-                # 更新定时器
-                self.timer.cancel()
-                self.timer = self.create_timer(1.0 / self.fps, self.publish_image)
-            elif param.name == 'resolution' and param.value != self.resolution:
-                self.resolution = param.value
-                needs_reinit = True
-            elif param.name == 'calibration_file' and param.value != self.calibration_file:
-                self.calibration_file = param.value
-                needs_reinit = True
-            elif param.name == 'undistort' and param.value != self.undistort:
-                self.undistort = param.value
-
-        # 如果需要，重新初始化摄像头
-        if needs_reinit:
-            self.initialize_camera()
-
-        return SetParametersResult(successful=True)
+            print(f"处理图像时出错: {str(e)}")
 
     def destroy_node(self):
         """节点销毁时释放资源"""
         if self.cap is not None:
             self.cap.release()
-        super().destroy_node()
-        self.get_logger().info("摄像头节点已关闭")
-
+        cv2.destroyAllWindows()
 
 def main(args=None):
-    rclpy.init(args=args)
     node = CameraNode()
     try:
-        rclpy.spin(node)
+        node.publish_image()
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

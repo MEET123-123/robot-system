@@ -1,48 +1,35 @@
-#!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import JointState, Imu
-from std_msgs.msg import Float64MultiArray, Bool
-from rcl_interfaces.msg import SetParametersResult
 import numpy as np
 import time
 import threading
-from enum import Enum
+import serial
+from datetime import datetime
+import csv
 
-
-class ForceSensorNode(Node):
+class ForceSensorNode:
     """手术机器人力传感器ROS 2节点"""
 
-    class SensorType(Enum):
-        F / T_SENSOR = 1  # 六维力/力矩传感器
-        PRESSURE_SENSOR = 2  # 压力传感器
-        FORCE_TORQUE_SENSOR = 3  # 力/扭矩传感器
+    class SensorType:
+        command_100Hz = [0x09, 0x10, 0x01, 0x9A, 0x00, 0x01, 0x02, 0x02, 0x00, 0xCD, 0xCA]
+        command_250Hz = [0x09, 0x10, 0x01, 0x9A, 0x00, 0x01, 0x02, 0x02, 0x01, 0x0C, 0x0A]
+        command_500Hz = [0x09, 0x10, 0x01, 0x9A, 0x00, 0x01, 0x02, 0x02, 0x02, 0x4C, 0x0B]
+        command_stop = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                        0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
 
     def __init__(self):
-        super().__init__('force_sensor_node')
 
-        # 声明参数
-        self.declare_parameter('sensor_type', 'F/T_SENSOR')
-        self.declare_parameter('sensor_id', 0)
-        self.declare_parameter('frame_id', 'force_sensor_link')
-        self.declare_parameter('sampling_rate', 100.0)  # Hz
-        self.declare_parameter('calibration_file', '')
-        self.declare_parameter('filter_window_size', 5)
-        self.declare_parameter('force_threshold', [5.0, 5.0, 5.0])  # N
-        self.declare_parameter('torque_threshold', [0.5, 0.5, 0.5])  # Nm
-
-        # 获取参数
-        self.sensor_type = self.get_parameter('sensor_type').value
-        self.sensor_id = self.get_parameter('sensor_id').value
-        self.frame_id = self.get_parameter('frame_id').value
-        self.sampling_rate = self.get_parameter('sampling_rate').value
-        self.calibration_file = self.get_parameter('calibration_file').value
-        self.filter_window_size = self.get_parameter('filter_window_size').value
-        self.force_threshold = np.array(self.get_parameter('force_threshold').value)
-        self.torque_threshold = np.array(self.get_parameter('torque_threshold').value)
-
-        # 注册参数回调
-        self.add_on_set_parameters_callback(self.parameters_callback)
+        # 初始化参数
+        # self.sensor_type = self.get_parameter('sensor_type').value
+        # self.sensor_id = self.get_parameter('sensor_id').value
+        # self.frame_id = self.get_parameter('frame_id').value
+        # self.sampling_rate = self.get_parameter('sampling_rate').value
+        # self.calibration_file = self.get_parameter('calibration_file').value
+        # self.filter_window_size = self.get_parameter('filter_window_size').value
+        # self.force_threshold = np.array(self.get_parameter('force_threshold').value)
+        # self.torque_threshold = np.array(self.get_parameter('torque_threshold').value)
+        # 定义串口参数
+        self.SERIAL_PORT = 'COM8'  # 替换为您的串口
+        self.BAUD_RATE = 115200  # Modbus RTU的波特率
 
         # 初始化传感器
         self.sensor = None
@@ -52,29 +39,8 @@ class ForceSensorNode(Node):
         self.filtered_data = np.zeros(6)
         self.emergency_stop = False
 
-        # 创建发布者
-        self.force_pub = self.create_publisher(
-            Float64MultiArray,
-            'force_sensor/data',
-            10
-        )
-
-        self.emergency_pub = self.create_publisher(
-            Bool,
-            'force_sensor/emergency_stop',
-            10
-        )
-
-        # 创建定时器
-        self.sampling_timer = self.create_timer(
-            1.0 / self.sampling_rate,
-            self.sample_data
-        )
-
         # 初始化传感器
         self.initialize_sensor()
-
-        self.get_logger().info(f'力传感器节点已启动，类型: {self.sensor_type}')
 
     def initialize_sensor(self):
         """初始化力传感器"""
